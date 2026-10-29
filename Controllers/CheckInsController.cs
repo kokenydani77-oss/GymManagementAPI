@@ -7,7 +7,7 @@ using GymManagementAPI.DTOs;
 namespace GymManagementAPI.Controllers;
 
 [ApiController]
-[Route("api/[controller]")] // Elérési cím: /api/checkins
+[Route("api/[controller]")] // /api/checkins
 public class CheckInsController : ControllerBase
 {
     private readonly AppDbContext _context;
@@ -17,83 +17,170 @@ public class CheckInsController : ControllerBase
         _context = context;
     }
 
-    // 1. Végpont: Beléptetés megkísérlése (POST /api/checkins)
+    // 1. BELÉPTETÉS: POST /api/checkins
     [HttpPost]
-    public async Task<ActionResult<CheckInLog>> CheckIn(CheckInRequestDto dto)
+    public async Task<IActionResult> CheckIn(CheckInRequestDto request)
     {
-        // 1. Tag ellenőrzése
+        // Tag ellenőrzése
         var member = await _context.Members
             .Include(m => m.Passes)
-            .FirstOrDefaultAsync(m => m.Id == dto.MemberId);
+            .FirstOrDefaultAsync(m => m.Id == request.MemberId);
 
         if (member == null)
         {
-            return NotFound("A megadott azonosítójú tag nem található.");
+            return NotFound($"A(z) {request.MemberId} azonosítójú tag nem található.");
         }
 
-        var now = DateTime.UtcNow;
+        // VÉDELEM: Ellenőrizzük, hogy nincs-e már bent a teremben
+        var alreadyInside = await _context.CheckInLogs
+            .AnyAsync(log => log.MemberId == request.MemberId && log.IsSuccessful && log.CheckOutTime == null);
 
-        // 2. Érvényes bérlet keresése
-        // Olyan bérlet kell, ami aktív, nem járt le az ideje, és ha alkalmas, van még belépése
-        var validPass = member.Passes.FirstOrDefault(p =>
-            p.IsActive &&
-            p.EndDate >= now &&
-            (p.Type == PassType.Monthly || (p.Type == PassType.Occasional && p.RemainingPasses > 0)));
-
-        // 3. Ha nincs érvényes bérlet: SIKERTELEN belépés naplózása
-        if (validPass == null)
+        if (alreadyInside)
         {
-            var failedLog = new CheckInLog
+            var duplicateRejectedLog = new CheckInLog
             {
-                MemberId = member.Id,
-                CheckInTime = now,
+                MemberId = request.MemberId,
+                CheckInTime = DateTime.UtcNow,
                 IsSuccessful = false,
-                RejectionReason = "Nincs érvényes bérlet (lejárt az időtartam vagy elfogytak az alkalmak)."
+                RejectionReason = "A tag már bent tartózkodik a teremben."
             };
-
-            _context.CheckInLogs.Add(failedLog);
+            _context.CheckInLogs.Add(duplicateRejectedLog);
             await _context.SaveChangesAsync();
 
-            return BadRequest(new { Message = "Belépés megtagadva!", Reason = failedLog.RejectionReason });
+            return BadRequest(new
+            {
+                message = "Belépés megtagadva!",
+                reason = "Már bent vagy a teremben! Előbb jelentkezz ki a kapunál."
+            });
         }
 
-        // 4. Ha alkalmas bérlet, levonunk 1 alkalmat
+        // Érvényes bérlet keresése
+        var now = DateTime.UtcNow;
+        var validPass = member.Passes.FirstOrDefault(p =>
+            p.IsActive &&
+            (
+                (p.Type == PassType.Monthly && p.EndDate >= now) ||
+                (p.Type == PassType.Occasional && p.RemainingPasses > 0)
+            )
+        );
+
+        // Ha nincs érvényes bérlet: elutasítás naplózása
+        if (validPass == null)
+        {
+            var rejectedLog = new CheckInLog
+            {
+                MemberId = request.MemberId,
+                CheckInTime = now,
+                IsSuccessful = false,
+                RejectionReason = "Nincs érvényes bérlet (lejárt vagy elfogyott)."
+            };
+            _context.CheckInLogs.Add(rejectedLog);
+            await _context.SaveChangesAsync();
+
+            return BadRequest(new
+            {
+                message = "Belépés megtagadva!",
+                reason = "Nincs érvényes bérlet (lejárt az időtartam vagy elfogytak az alkalmak)."
+            });
+        }
+
+        // 10 alkalmas bérlet esetén csökkentjük az alkalmak számát
         if (validPass.Type == PassType.Occasional)
         {
             validPass.RemainingPasses--;
             if (validPass.RemainingPasses == 0)
             {
-                validPass.IsActive = false; // Ha elfogyott az összes alkalom, inaktiváljuk
+                validPass.IsActive = false;
             }
         }
 
-        // 5. SIKERES belépés naplózása
+        // Sikeres belépés naplózása (CheckOutTime induláskor null)
         var successLog = new CheckInLog
         {
-            MemberId = member.Id,
+            MemberId = request.MemberId,
             CheckInTime = now,
-            IsSuccessful = true,
+            CheckOutTime = null,
+            IsSuccessful = true
         };
-
         _context.CheckInLogs.Add(successLog);
+
         await _context.SaveChangesAsync();
 
-        return Ok(new 
-        { 
-            Message = $"Sikeres belépés! Jó edzést, {member.FullName}!", 
-            PassType = validPass.Type.ToString(),
-            RemainingPasses = validPass.RemainingPasses,
-            Log = successLog 
+        return Ok(new
+        {
+            message = $"Sikeres belépés! Jó edzést, {member.FullName}!",
+            passType = validPass.Type.ToString(),
+            remainingPasses = validPass.RemainingPasses,
+            log = successLog
         });
     }
 
-    // 2. Végpont: Belépési napló lekérése egy taghoz (GET /api/checkins/member/1)
+    // 2. KILÉPTETÉS: POST /api/checkins/checkout
+    [HttpPost("checkout")]
+    public async Task<IActionResult> CheckOut(CheckOutRequestDto request)
+    {
+        // Megkeressük a tag legutóbbi bentlétét, ahol még nincs kilépési idő
+        var activeStay = await _context.CheckInLogs
+            .Where(log => log.MemberId == request.MemberId && log.IsSuccessful && log.CheckOutTime == null)
+            .OrderByDescending(log => log.CheckInTime)
+            .FirstOrDefaultAsync();
+
+        if (activeStay == null)
+        {
+            return BadRequest(new
+            {
+                message = "Kiléptetés sikertelen!",
+                reason = "Ez a tag jelenleg nincs bent a teremben, vagy már kijelentkezett."
+            });
+        }
+
+        // Rögzítjük a távozás idejét
+        activeStay.CheckOutTime = DateTime.UtcNow;
+        await _context.SaveChangesAsync();
+
+        var duration = activeStay.CheckOutTime.Value - activeStay.CheckInTime;
+
+        return Ok(new
+        {
+            message = "Sikeres kilépés! Viszlát legközelebb!",
+            checkInTime = activeStay.CheckInTime,
+            checkOutTime = activeStay.CheckOutTime,
+            stayDurationMinutes = Math.Round(duration.TotalMinutes, 1)
+        });
+    }
+
+    // 3. ÉLŐ LÉTSZÁM LEKÉRDEZÉSE: GET /api/checkins/occupancy
+    [HttpGet("occupancy")]
+    public async Task<IActionResult> GetCurrentOccupancy()
+    {
+        var currentCount = await _context.CheckInLogs
+            .CountAsync(log => log.IsSuccessful && log.CheckOutTime == null);
+
+        var peopleInside = await _context.CheckInLogs
+            .Where(log => log.IsSuccessful && log.CheckOutTime == null)
+            .Include(log => log.Member)
+            .Select(log => new
+            {
+                memberId = log.MemberId,
+                memberName = log.Member != null ? log.Member.FullName : "Ismeretlen",
+                enteredAt = log.CheckInTime
+            })
+            .ToListAsync();
+
+        return Ok(new
+        {
+            currentPeopleCount = currentCount,
+            membersInside = peopleInside
+        });
+    }
+
+    // 4. EGY TAG BELÉPÉSI ELŐZMÉNYEI: GET /api/checkins/member/1
     [HttpGet("member/{memberId}")]
-    public async Task<ActionResult<List<CheckInLog>>> GetLogsForMember(int memberId)
+    public async Task<IActionResult> GetMemberCheckIns(int memberId)
     {
         var logs = await _context.CheckInLogs
-            .Where(c => c.MemberId == memberId)
-            .OrderByDescending(c => c.CheckInTime) // A legfrissebb belépések legyenek elöl
+            .Where(log => log.MemberId == memberId)
+            .OrderByDescending(log => log.CheckInTime)
             .ToListAsync();
 
         return Ok(logs);

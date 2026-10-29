@@ -26,6 +26,9 @@ namespace GymManagementAPI.Migrations
                     b.Property<DateTime>("CheckInTime")
                         .HasColumnType("TEXT");
 
+                    b.Property<DateTime?>("CheckOutTime")
+                        .HasColumnType("TEXT");
+
                     b.Property<bool>("IsSuccessful")
                         .HasColumnType("INTEGER");
 
@@ -33,7 +36,6 @@ namespace GymManagementAPI.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("RejectionReason")
-                        .IsRequired()
                         .HasColumnType("TEXT");
 
                     b.HasKey("Id");
